@@ -22,13 +22,12 @@ namespace MigrateContentToHeartcore.Heartcore
             _http = http;
             _options = options;
 
-            // Management API (Heartcore) base. We intentionally avoid the legacy "/umbraco/management/api/v1" path.
-            // For Delivery (read-only) the base would be https://cdn.umbraco.io/, which we are NOT using here.
             _http.BaseAddress = new Uri("https://api.umbraco.io/");
             _http.DefaultRequestHeaders.Clear();
             _http.DefaultRequestHeaders.Add("Umb-Project-Alias", _options.ProjectAlias);
             _http.DefaultRequestHeaders.Add("Api-Key", _options.ApiKey);
-            _http.Timeout = TimeSpan.FromSeconds(100);
+            _http.DefaultRequestHeaders.ConnectionClose = false; // Keep connections alive
+            _http.Timeout = TimeSpan.FromSeconds(300); // Increase timeout for bulk operations
         }
 
         public async Task ValidateParentAsync(Guid parentKey, CancellationToken ct)
@@ -42,118 +41,192 @@ namespace MigrateContentToHeartcore.Heartcore
         public async Task<Dictionary<string, (Guid key, string name)>> GetChildrenIndexAsync(Guid parentKey, CancellationToken ct)
         {
             var result = new Dictionary<string, (Guid, string)>(StringComparer.OrdinalIgnoreCase);
+            var url = $"content/{parentKey}/children?page=1&pageSize=500"; // increased page size
 
-            // Prefer the Management API route shape: /content/{parentKey}/children
-            var primaryUrl = $"content/{parentKey}/children?skip=0&take=200"; // route shape B (preferred)
-            // Fallback to the alternative route shape if the server supports it
-            var fallbackUrl = $"content/children?parentKey={parentKey}&skip=0&take=200"; // route shape A (alternative)
-
-            var url = primaryUrl;
-            var triedFallback = false;
-
-            while (true)
+            while (!string.IsNullOrEmpty(url))
             {
                 using var resp = await _http.GetAsync(url, ct);
-
-                if (resp.StatusCode == HttpStatusCode.NotFound || resp.StatusCode == HttpStatusCode.BadRequest)
-                {
-                    // Some deployments return400 when hitting an unsupported route shape (e.g., interpreting "children" as an id)
-                    if (!triedFallback && url == primaryUrl)
-                    {
-                        triedFallback = true;
-                        url = fallbackUrl;
-                        continue;
-                    }
-
-                    if (resp.StatusCode == HttpStatusCode.NotFound)
-                    {
-                        // No children
-                        return result;
-                    }
-                }
-
+                if (resp.StatusCode == HttpStatusCode.NotFound) return result;
+                
                 await ThrowIfFailedAsync(resp, ct);
 
                 var json = await resp.Content.ReadAsStringAsync(ct);
                 using var doc = JsonDocument.Parse(json);
                 var root = doc.RootElement;
 
-                if (root.TryGetProperty("items", out var items))
+                if (root.TryGetProperty("_embedded", out var embedded) && 
+                    embedded.TryGetProperty("content", out var contentArray))
                 {
-                    foreach (var item in items.EnumerateArray())
+                    foreach (var item in contentArray.EnumerateArray())
                     {
-                        var key = item.GetProperty("key").GetGuid();
-                        var name = item.GetProperty("name").GetString() ?? string.Empty;
-                        if (item.TryGetProperty("properties", out var props))
+                        if (item.TryGetProperty("_id", out var idEl) && 
+                            item.TryGetProperty("name", out var nameEl))
                         {
-                            foreach (var prop in props.EnumerateArray())
+                            var key = idEl.GetGuid();
+                            string name = string.Empty;
+                            using (var e = nameEl.EnumerateObject())
                             {
-                                var alias = prop.GetProperty("alias").GetString();
-                                if (string.Equals(alias, "showId", StringComparison.OrdinalIgnoreCase))
+                                if (e.MoveNext())
                                 {
-                                    var value = prop.GetProperty("value").GetString();
-                                    if (!string.IsNullOrEmpty(value))
-                                    {
-                                        result[value] = (key, name);
-                                    }
+                                    name = e.Current.Value.GetString() ?? string.Empty;
+                                }
+                            }
+
+                            if (item.TryGetProperty("showId", out var showIdProp) &&
+                                showIdProp.ValueKind == JsonValueKind.Object &&
+                                showIdProp.TryGetProperty("$invariant", out var invariantValue))
+                            {
+                                var showId = invariantValue.GetString();
+                                if (!string.IsNullOrEmpty(showId))
+                                {
+                                    result[showId] = (key, name);
                                 }
                             }
                         }
                     }
                 }
 
-                // Pagination
-                if (root.TryGetProperty("pagination", out var pag) &&
-                    pag.TryGetProperty("next", out var next) && next.ValueKind == JsonValueKind.String)
+                // Check for pagination
+                url = null;
+                if (root.TryGetProperty("_links", out var links) && 
+                    links.TryGetProperty("next", out var nextLink) && 
+                    nextLink.TryGetProperty("href", out var nextHref) &&
+                    nextHref.ValueKind == JsonValueKind.String)
                 {
-                    var nextUrl = next.GetString();
-                    if (string.IsNullOrEmpty(nextUrl)) break;
-                    url = nextUrl!; // could be absolute or relative
-                }
-                else
-                {
-                    break;
+                    url = nextHref.GetString();
                 }
             }
 
             return result;
         }
 
-        // Media upload via Management API base
+        // Media upload via Management API - create image media item with file
         public async Task<string?> UploadMediaAsync(Guid parentFolderKey, string fileName, string contentType, Stream content, CancellationToken ct)
         {
-            using var form = new MultipartFormDataContent();
-            var streamContent = new StreamContent(content);
-            streamContent.Headers.ContentType = new MediaTypeHeaderValue(contentType);
-            form.Add(streamContent, name: "file", fileName: fileName);
-            form.Add(new StringContent(parentFolderKey.ToString()), name: "parentKey");
-
-            using var resp = await _http.PostAsync("media/upload", form, ct);
-            await ThrowIfFailedAsync(resp, ct);
-            var json = await resp.Content.ReadFromJsonAsync<JsonElement>(cancellationToken: ct);
-            if (json.TryGetProperty("udi", out var udiEl) && udiEl.ValueKind == JsonValueKind.String)
-                return udiEl.GetString();
-            if (json.TryGetProperty("key", out var keyEl) && keyEl.ValueKind == JsonValueKind.String)
+            try
             {
-                var key = keyEl.GetString();
-                return key is null ? null : $"umb://media/{key}";
+                var mediaName = Path.GetFileNameWithoutExtension(fileName);
+                
+                // Create multipart form with the exact format from documentation
+                var boundary = "MultipartBoundary";
+                using var form = new MultipartFormDataContent(boundary);
+                
+                // Add content JSON part - media metadata with file reference
+                var mediaJson = JsonSerializer.Serialize(new
+                {
+                    mediaTypeAlias = "Image",
+                    parentId = parentFolderKey.ToString(),
+                    name = mediaName,
+                    umbracoFile = new Dictionary<string, string> { ["$invariant"] = fileName }
+                }, JsonOpts);
+                
+                var jsonContent = new StringContent(mediaJson, Encoding.UTF8, "application/json");
+                jsonContent.Headers.ContentDisposition = new ContentDispositionHeaderValue("form-data")
+                {
+                    Name = "\"content\""
+                };
+                form.Add(jsonContent);
+                
+                // Add file part with name format: propertyAlias.culture
+                var fileContent = new StreamContent(content);
+                fileContent.Headers.ContentType = new MediaTypeHeaderValue(contentType);
+                fileContent.Headers.ContentDisposition = new ContentDispositionHeaderValue("form-data")
+                {
+                    Name = "\"umbracoFile.$invariant\"",
+                    FileName = $"\"{fileName}\""
+                };
+                form.Add(fileContent);
+                
+                var response = await _http.PostAsync("media", form, ct);
+                if (!response.IsSuccessStatusCode) return null;
+                
+                var responseBody = await response.Content.ReadAsStringAsync(ct);
+                using var doc = JsonDocument.Parse(responseBody);
+                var root = doc.RootElement;
+                
+                return root.TryGetProperty("_id", out var idEl)
+                    ? $"umb://media/{idEl.GetString()}"
+                    : null;
             }
-            return null;
+            catch
+            {
+                return null;
+            }
         }
 
         // Create content using Management API /content
         public async Task<Guid> CreateContentAsync(object payload, CancellationToken ct)
         {
-            using var resp = await _http.PostAsync("content", new StringContent(JsonSerializer.Serialize(payload, JsonOpts), Encoding.UTF8, "application/json"), ct);
+            var json = JsonSerializer.Serialize(payload, JsonOpts);
+            using var resp = await _http.PostAsync("content", new StringContent(json, Encoding.UTF8, "application/json"), ct);
             await ThrowIfFailedAsync(resp, ct);
-            var json = await resp.Content.ReadFromJsonAsync<JsonElement>(cancellationToken: ct);
-            return json.GetProperty("key").GetGuid();
+            
+            var responseBody = await resp.Content.ReadAsStringAsync(ct);
+            var result = JsonDocument.Parse(responseBody);
+            var root = result.RootElement;
+            
+            // Heartcore returns _id, not key
+            if (root.TryGetProperty("_id", out var idProp))
+                return idProp.GetGuid();
+            if (root.TryGetProperty("id", out var idProp2))
+                return idProp2.GetGuid();
+            if (root.TryGetProperty("key", out var keyProp))
+                return keyProp.GetGuid();
+                
+            throw new InvalidOperationException($"Could not find content key in response");
+        }
+
+        // New: Create content with file in single multipart request
+        public async Task<Guid> CreateContentWithFileAsync(
+            object contentPayload,
+            string filePropertyAlias,
+            string filePropertyCulture,
+            string fileName,
+            string contentType,
+            Stream fileStream,
+            CancellationToken ct)
+        {
+            var boundary = "MultipartBoundary";
+            using var form = new MultipartFormDataContent(boundary);
+
+            // JSON content part
+            var json = JsonSerializer.Serialize(contentPayload, JsonOpts);
+            var jsonContent = new StringContent(json, Encoding.UTF8, "application/json");
+            jsonContent.Headers.ContentDisposition = new ContentDispositionHeaderValue("form-data")
+            {
+                Name = "\"content\""
+            };
+            form.Add(jsonContent);
+
+            // File part: propertyAlias.culture
+            var partName = $"{filePropertyAlias}.{filePropertyCulture}";
+            var fileContent = new StreamContent(fileStream);
+            fileContent.Headers.ContentType = new MediaTypeHeaderValue(contentType);
+            fileContent.Headers.ContentDisposition = new ContentDispositionHeaderValue("form-data")
+            {
+                Name = $"\"{partName}\"",
+                FileName = $"\"{fileName}\""
+            };
+            form.Add(fileContent);
+
+            using var resp = await _http.PostAsync("content", form, ct);
+            await ThrowIfFailedAsync(resp, ct);
+
+            var body = await resp.Content.ReadAsStringAsync(ct);
+            using var doc = JsonDocument.Parse(body);
+            var root = doc.RootElement;
+            if (root.TryGetProperty("_id", out var idProp)) return idProp.GetGuid();
+            if (root.TryGetProperty("id", out var idProp2)) return idProp2.GetGuid();
+            if (root.TryGetProperty("key", out var keyProp)) return keyProp.GetGuid();
+
+            throw new InvalidOperationException("Could not find content key in response");
         }
 
         // Update content using Management API /content/{key}
         public async Task UpdateContentAsync(Guid key, object payload, CancellationToken ct)
         {
-            using var resp = await _http.PutAsync($"content/{key}", new StringContent(JsonSerializer.Serialize(payload, JsonOpts), Encoding.UTF8, "application/json"), ct);
+            var json = JsonSerializer.Serialize(payload, JsonOpts);
+            using var resp = await _http.PutAsync($"content/{key}", new StringContent(json, Encoding.UTF8, "application/json"), ct);
             await ThrowIfFailedAsync(resp, ct);
         }
 
@@ -161,8 +234,95 @@ namespace MigrateContentToHeartcore.Heartcore
         public async Task PublishAsync(Guid key, string culture, CancellationToken ct)
         {
             var body = new { cultures = new[] { culture } };
-            using var resp = await _http.PostAsync($"content/{key}/publish", new StringContent(JsonSerializer.Serialize(body, JsonOpts), Encoding.UTF8, "application/json"), ct);
-            await ThrowIfFailedAsync(resp, ct);
+            var json = JsonSerializer.Serialize(body, JsonOpts);
+            using var resp = await _http.PutAsync($"content/{key}/publish", new StringContent(json, Encoding.UTF8, "application/json"), ct);
+            if (!resp.IsSuccessStatusCode)
+            {
+                // Silently fail - don't stop the migration
+            }
+        }
+
+        // Delete content item
+        public async Task DeleteContentAsync(Guid key, CancellationToken ct)
+        {
+            try
+            {
+                using var resp = await _http.DeleteAsync($"content/{key}", ct);
+                if (!resp.IsSuccessStatusCode)
+                {
+                    var errorBody = await resp.Content.ReadAsStringAsync(ct);
+                    Console.WriteLine($"   ?? Failed to delete content {key}: {resp.StatusCode}");
+                }
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"   ? Delete content exception: {ex.Message}");
+            }
+        }
+
+        // Delete media item
+        public async Task DeleteMediaAsync(Guid key, CancellationToken ct)
+        {
+            try
+            {
+                using var resp = await _http.DeleteAsync($"media/{key}", ct);
+                if (!resp.IsSuccessStatusCode)
+                {
+                    var errorBody = await resp.Content.ReadAsStringAsync(ct);
+                    Console.WriteLine($"   ?? Failed to delete media {key}: {resp.StatusCode}");
+                }
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"   ? Delete media exception: {ex.Message}");
+            }
+        }
+
+        // Get all media items in a folder
+        public async Task<List<Guid>> GetMediaInFolderAsync(Guid folderKey, CancellationToken ct)
+        {
+            var result = new List<Guid>();
+            try
+            {
+                var url = $"media/{folderKey}/children?page=1&pageSize=500";
+                
+                while (!string.IsNullOrEmpty(url))
+                {
+                    using var resp = await _http.GetAsync(url, ct);
+                    if (!resp.IsSuccessStatusCode) break;
+                    
+                    var json = await resp.Content.ReadAsStringAsync(ct);
+                    using var doc = JsonDocument.Parse(json);
+                    var root = doc.RootElement;
+                    
+                    if (root.TryGetProperty("_embedded", out var embedded) && 
+                        embedded.TryGetProperty("media", out var mediaArray))
+                    {
+                        foreach (var item in mediaArray.EnumerateArray())
+                        {
+                            if (item.TryGetProperty("_id", out var idEl))
+                            {
+                                result.Add(idEl.GetGuid());
+                            }
+                        }
+                    }
+                    
+                    // Check for next page
+                    url = null;
+                    if (root.TryGetProperty("_links", out var links) && 
+                        links.TryGetProperty("next", out var nextLink) && 
+                        nextLink.TryGetProperty("href", out var nextHref))
+                    {
+                        url = nextHref.GetString();
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"   ? Failed to get media in folder: {ex.Message}");
+            }
+            
+            return result;
         }
 
         private static async Task ThrowIfFailedAsync(HttpResponseMessage resp, CancellationToken ct)

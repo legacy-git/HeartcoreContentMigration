@@ -1,169 +1,95 @@
 using MigrateContentToHeartcore.DTOs;
-using System.Net;
 
 namespace MigrateContentToHeartcore.Heartcore
 {
- internal sealed class UpsertService
- {
- private readonly HeartcoreClient _client;
- private readonly HeartcoreOptions _opt;
- private readonly HttpClient _http;
- private readonly Translator? _translator;
+	internal sealed class UpsertService
+	{
+		private readonly HeartcoreClient _client;
+		private readonly HeartcoreOptions _opt;
+		private readonly HttpClient _http;
 
- public UpsertService(HeartcoreClient client, HeartcoreOptions opt, HttpClient http, Translator? translator = null)
- {
- _client = client;
- _opt = opt;
- _http = http;
- _translator = translator;
- }
+		public UpsertService(HeartcoreClient client, HeartcoreOptions opt, HttpClient http)
+		{
+			_client = client;
+			_opt = opt;
+			_http = http;
+		}
 
- public async Task<bool> UpsertAsync(TVMazeShow show, Dictionary<string,(Guid key,string name)> existingIndex, CancellationToken ct)
- {
- // Build or locate image UDI if needed
- string? posterUdi = null;
+		public async Task<Guid?> UpsertAndGetKeyAsync(TVMazeShow show, IReadOnlyDictionary<string,(Guid key,string name)> existingIndex, CancellationToken ct)
+		{
+			// Check for duplicates FIRST
+			if (existingIndex.TryGetValue(show.Id.ToString(), out var _))
+			{
+				return null; // Skip existing
+			}
+			
+			var name = show.Name ?? $"Show {show.Id}";
+			var summary = show.Summary ?? string.Empty;
 
- // Only populate image if missing later, but we need UDI when creating a new content
- if (!existingIndex.ContainsKey(show.Id.ToString()))
- {
- posterUdi = await EnsurePosterAsync(show, ct);
- }
+			// Base payload
+			var payload = new Dictionary<string, object>
+			{
+				["contentTypeAlias"] = "tVShow",
+				["parentId"] = _opt.ShowsParentKey.ToString(),
+				["sortOrder"] = 0,
+				["showId"] = new Dictionary<string, string> { ["$invariant"] = show.Id.ToString() }
+			};
 
- var name = show.Name ?? $"Show {show.Id}";
- var summaryEn = show.Summary; // TVMaze provides HTML
- string? summaryDa = null;
- if (_opt.ImportCultures.Contains("da", StringComparer.OrdinalIgnoreCase))
- {
- summaryDa = await (_translator?.TranslateAsync(summaryEn, to: "da") ?? Task.FromResult(summaryEn));
- }
+			// Name
+			var nameDict = new Dictionary<string, string>();
+			foreach (var culture in _opt.ImportCultures) nameDict[culture] = name;
+			payload["name"] = nameDict;
 
- // Invariant values
- var valuesInvariant = new List<object>
- {
- new { alias = "showId", value = show.Id.ToString() }
- };
- if (posterUdi != null)
- {
- valuesInvariant.Add(new { alias = "showImage", value = posterUdi });
- }
- // genres block list
- var genresValue = BuildGenresBlockList(show);
- if (genresValue is not null)
- {
- valuesInvariant.Add(new { alias = "showGenres", value = genresValue });
- }
+			// Summary
+			var summaryDict = new Dictionary<string, string>();
+			foreach (var culture in _opt.ImportCultures) summaryDict[culture] = summary;
+			payload["showSummary"] = summaryDict;
 
- // Variant values per culture
- var variants = new List<object>();
- variants.Add(new
- {
- culture = "en-US",
- name,
- values = new List<object>
- {
- new { alias = "showSummary", value = (object?)summaryEn }
- }
- });
- if (_opt.ImportCultures.Contains("da", StringComparer.OrdinalIgnoreCase))
- {
- variants.Add(new
- {
- culture = "da",
- name,
- values = new List<object>
- {
- new { alias = "showSummary", value = (object?)summaryDa }
- }
- });
- }
+			// Genres (tags)
+			var genresTags = BuildGenresTags(show);
+			if (genresTags != null)
+				payload["showGenres"] = new Dictionary<string, object> { ["$invariant"] = genresTags };
 
- if (!existingIndex.TryGetValue(show.Id.ToString(), out var existing))
- {
- var payload = new
- {
- contentTypeAlias = "tVShow",
- parentKey = _opt.ShowsParentKey,
- values = valuesInvariant,
- variants = variants
- };
- var key = await _client.CreateContentAsync(payload, ct);
- if (_opt.PublishImmediately)
- {
- foreach (var c in _opt.ImportCultures)
- {
- await _client.PublishAsync(key, c, ct);
- }
- }
- return true;
- }
- else
- {
- var payload = new
- {
- values = valuesInvariant,
- variants = variants
- };
- await _client.UpdateContentAsync(existing.key, payload, ct);
- if (_opt.PublishImmediately)
- {
- foreach (var c in _opt.ImportCultures)
- {
- await _client.PublishAsync(existing.key, c, ct);
- }
- }
- return true;
- }
- }
+			// Choose image URL based on preference (prefer medium to reduce bytes)
+			string? url = _opt.ImagePreferredSize.Equals("original", StringComparison.OrdinalIgnoreCase)
+				? (show.Image?.Original ?? show.Image?.Medium)
+				: (show.Image?.Medium ?? show.Image?.Original);
 
- private async Task<string?> EnsurePosterAsync(TVMazeShow show, CancellationToken ct)
- {
- var url = show.Image?.Original ?? show.Image?.Medium;
- if (string.IsNullOrWhiteSpace(url)) return null;
- try
- {
- using var resp = await _http.GetAsync(url, ct);
- if (!resp.IsSuccessStatusCode) return null;
- var contentType = resp.Content.Headers.ContentType?.MediaType ?? "image/jpeg";
- var fileName = Path.GetFileName(new Uri(url).AbsolutePath);
- await using var stream = await resp.Content.ReadAsStreamAsync(ct);
- return await _client.UploadMediaAsync(_opt.MediaFolderKey, fileName, contentType, stream, ct);
- }
- catch (HttpRequestException) { return null; }
- }
+			if (!string.IsNullOrWhiteSpace(url))
+			{
+				using var resp = await _http.GetAsync(url, HttpCompletionOption.ResponseHeadersRead, ct);
+				if (resp.IsSuccessStatusCode)
+				{
+					var contentType = resp.Content.Headers.ContentType?.MediaType ?? "image/jpeg";
+					var fileName = Path.GetFileName(new Uri(url).AbsolutePath);
 
- private object? BuildGenresBlockList(TVMazeShow show)
- {
- if (_opt.GenreElementTypeKey is null) return null;
- var genres = show.Genres;
- if (genres is null || genres.Length ==0) return null;
- var items = new List<BlockListItem>();
- for (int i =0; i < genres.Length; i++)
- {
- var g = genres[i];
- var item = new BlockListItem
- {
- ContentTypeKey = _opt.GenreElementTypeKey.Value,
- Variants = new()
- {
- new BlockListVariant
- {
- Culture = "en-US",
- Name = g,
- Values = new()
- {
- new BlockListProperty{ Alias = "indexNumber", Value = (i+1).ToString() },
- new BlockListProperty{ Alias = "title", Value = g }
- }
- }
- }
- };
- items.Add(item);
- }
- return new
- {
- layout = new List<object>(),
- contentData = items
- };
- }
- }
+					await using var stream = await resp.Content.ReadAsStreamAsync(ct);
+
+					// JSON must include the filename for the upload property
+					payload["showImage"] = new Dictionary<string, string> { ["$invariant"] = fileName };
+
+					var key = await _client.CreateContentWithFileAsync(
+						contentPayload: payload,
+						filePropertyAlias: "showImage",
+						filePropertyCulture: "$invariant",
+						fileName: fileName,
+						contentType: contentType,
+						fileStream: stream,
+						ct: ct);
+
+					return key;
+				}
+			}
+
+			// Fallback when no image available
+			return await _client.CreateContentAsync(payload, ct);
+		}
+
+		private string? BuildGenresTags(TVMazeShow show)
+		{
+			var genres = show.Genres;
+			if (genres == null || genres.Length == 0) return null;
+			return string.Join(",", genres);
+		}
+	}
 }
