@@ -4,13 +4,13 @@
       "commandName": "Project",
       "environmentVariables": {
         "HEARTCORE_PROJECT_ALIAS": "heartcoremigration",
-        "HEARTCORE_MANAGEMENT_API_KEY": "insert key",
+        "HEARTCORE_MANAGEMENT_API_KEY": "odqBDaHI0NWVGhOmFmNh",
         "HEARTCORE_SHOWS_PARENT_KEY": "44e5cf6a-6c57-4db6-885a-6f356bd9e07e",
         "HEARTCORE_MEDIA_FOLDER_KEY": "6f51a5d7-bae0-4f4e-81ef-49e422e04a20",
         "HEARTCORE_IMPORT_CULTURES": "en-US;da",
         "HEARTCORE_PUBLISH_IMMEDIATELY": "false",
-        "HEARTCORE_TAKE": "500",
-        "HEARTCORE_MAX_DEGREE": "4"
+        "HEARTCORE_TAKE": "2000",
+        "HEARTCORE_MAX_DEGREE": "10"
       }
     }
   }

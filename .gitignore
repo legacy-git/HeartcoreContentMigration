@@ -482,3 +482,6 @@ $RECYCLE.BIN/
 
 # Vim temporary swap files
 *.swp
+
+# Ignore local launch settings containing environment-specific secrets
+MigrateContentToHeartcore/Properties/launchSettings.json
